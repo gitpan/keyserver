@@ -1,0 +1,31 @@
+keyserver version 1.04
+======================
+
+A Perl-based RSA Key Server for use with Scooby.
+
+See: http://glasnost.itcarlow.ie/~scooby/ for more details.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+
+then as root:
+
+   make install
+
+DEPENDENCIES
+
+This module requires these other modules and libraries:
+
+  Crypt::RSA, Net::MySQL and libwww-perl.
+
+COPYRIGHT AND LICENCE
+
+Copyright (c) 2003, Paul Barry.  All Rights Reserved.
+
+This module is free software.  It may be used, redistributed 
+and/or modified under the same terms as Perl itself.
+

@@ -1,0 +1,1020 @@
+#! /usr/bin/perl -w
+
+# keyserver - The Responder/Registration Public-Key Service for use with the 
+#             Devel::Scooby, Mobile::Executive and Mobile::Location modules.
+#
+# Author:  Paul Barry, paul.barry@itcarlow.ie
+# Create:  April 2003.
+# Update:  May 2003 - added support for new protocol_port field in database.
+#                   - added support for logging to the LOGFILE.
+#                   - added support for HTTP web-based monitoring.
+
+our $VERSION = 1.04;
+
+use strict;
+
+use Crypt::RSA;        # Provides signing service for authentication.
+use HTTP::Daemon;      # Provides a basic HTTP server.
+use HTTP::Status;      # Provides support for HTTP status messages.
+use IO::Socket;        # Provides OO interface to TCP/IP sockets API.
+use Net::MySQL;        # Allows for direct communications with MySQL db.
+use POSIX 'WNOHANG';   # Ensures POSIX-compliant handling of "zombies".
+use Sys::Hostname;     # Provides a means of determining the name of machine.
+
+use constant KEYSRV_PASSWD       => 'keyserver';
+use constant KEY_SIZE            => 1024;
+
+use constant ENABLED_LOGGING     => 1;  # Set to 0 to disable logging to LOGFILE.
+use constant ENABLED_PRINTS      => 1;  # Set to 0 to disable screen messages.
+
+use constant SIGNATURE_DELIMITER => "\n--end-sig--\n";
+
+use constant HTML_DEFAULT_PAGE   => "index.html";
+use constant HTTP_PORT           => 8080;
+
+use constant CONFIGHOSTS_FILE    => '.keyserverrc';
+
+use constant RESPONDER_PPORT     => '30001';  
+use constant REGISTRATION_PPORT  => '30002';  
+
+use constant LOCALHOST           => '127.0.0.1';
+
+use constant KEYDB_HOST          => 'localhost';
+use constant KEYDB_DB            => 'SCOOBY';
+use constant KEYDB_USER          => 'perlagent';
+use constant KEYDB_PASS          => 'passwordhere';
+
+use constant TRUE                => 1;
+use constant FALSE               => 0;
+
+use constant LOGFILE             => 'keyserver.log';
+
+use constant VISIT_SCOOBY        => 'Visit the <a href="http://glasnost.itcarlow.ie/~scooby/">Scooby Website</a> at IT Carlow.<p>';
+
+# The "%allowed_connections" hash is written to during the start-up phase 
+# of this program.  It is referred to later, but should NEVER be written to.
+
+our %allowed_connections = (); # XXXXX: this is a 'global'.
+
+# Install a signal-handler to kill off "zombies" should they arise.
+
+$SIG{CHLD} = sub { while ( ( my $kid = waitpid( -1, WNOHANG ) ) > 0 ) { } };
+
+##########################################################################
+# Support subroutines start here.
+##########################################################################
+
+sub _logger {
+
+    # This small routine quickly writes a message to the LOGFILE.  Note that every line written
+    # to the LOGFILE is timestamped.  
+    #
+    # Note: a more "efficient" implementation would open the LOGFILE when the keyserver starts
+    #       up then append to it as required.  This method will do for now.
+    #
+    # IN:   a message to log.
+    #
+    # OUT:  nothing.
+
+    # Open the LOGFILE for append >>.
+
+    open KEY_LOGFILE, ">>" . LOGFILE
+        or die "keyserver: unable to append to this keyserver's LOGFILE.\n";
+
+    print KEY_LOGFILE scalar localtime, ": @_\n";
+
+    close KEY_LOGFILE;
+}
+
+sub _build_index_dot_html {
+
+    # Builds the INDEX.HTML file (used by _start_web_service).
+    #
+    # IN:  nothing.
+    #
+    # OUT: nothing (although "index.html" is created).
+
+    open HTMLFILE, ">index.html"
+        or die "Fatal error: index.html cannot be written to: $!.\n";
+
+    print HTMLFILE<<end_html;
+
+<HTML>
+<HEAD>
+<TITLE>Welcome to the Key Server's Web-Based Monitoring Service.</TITLE>
+</HEAD>
+<BODY>
+<h2>Welcome to the Key Server's Web-Based Monitoring Service</h2>
+end_html
+
+    print HTMLFILE "Key Server running on: <b>" . hostname() . "</b>.<p>";
+    print HTMLFILE "Key Server date/time: <b>" . localtime() . "</b>.<p>";
+    print HTMLFILE<<end_html;
+
+Click <a href="clearlog.html">here</a> to reset the log.
+<h2>Logging Details</h2>
+<pre>
+end_html
+
+    open HTTP_LOGFILE, LOGFILE
+        or die "keyserver: the LOGFILE is missing - aborting.\n";
+
+    while ( my $logline = <HTTP_LOGFILE> )
+    {
+        print HTMLFILE "$logline";
+    }
+
+    close HTTP_LOGFILE;
+
+    print HTMLFILE<<end_html;
+
+</pre>
+end_html
+
+    print HTMLFILE VISIT_SCOOBY;
+    print HTMLFILE<<end_html;
+
+</BODY>
+</HTML>
+end_html
+
+    close HTMLFILE;
+}
+
+sub _build_clearlog_dot_html {
+
+    # Builds the CLEARLOG.HTML file (used by _start_web_service).
+    #
+    # IN:  the name of the just-created backup file.
+    #
+    # OUT: nothing (although "clearlog.html" is created).
+
+    my $backup_log = shift;
+
+    open CLEARLOG_HTML, ">clearlog.html"
+        or die "Fatal error: clearlog.html cannot be written to: $!.\n";
+
+    print CLEARLOG_HTML<<end_html;
+
+<HTML>
+<HEAD>
+<TITLE>Key Server's Logfile Reset.</TITLE>
+</HEAD>
+<BODY>
+<h2>Key Server's Logfile Reset</h2>
+The previous logfile has been archived as: <b>$backup_log</b><p>
+Return to the Key Server's <a href="index.html">main page</a>.<p>
+end_html
+
+    print CLEARLOG_HTML VISIT_SCOOBY;
+    print CLEARLOG_HTML<<end_html;
+
+</BODY>
+<HTML>
+end_html
+
+    close CLEARLOG_HTML;
+}
+
+sub _start_web_service {
+
+    # Starts a small web server running on port HTTP_PORT.  Provides for some
+    # simple monitoring of the keyserver.
+    #
+    # IN:  nothing.
+    #
+    # OUT: nothing.
+
+    my $httpd = HTTP::Daemon->new( LocalPort => HTTP_PORT,
+                                   Reuse     => 1 )
+        or die "keyserver: could not create HTTP daemon on " .
+                    HTTP_PORT . ".\n";
+
+    while ( my $http_client = $httpd->accept )
+    {
+        if ( my $service = $http_client->get_request ) 
+        {
+            my $request = $service->uri->path;
+
+            if ( $service->method eq 'GET' )
+            {
+                my $resource;
+        
+                if ( $request eq "/"  || $request eq "/index.html" )
+                { 
+                    $resource = HTML_DEFAULT_PAGE;
+
+                    _build_index_dot_html;
+
+                    $http_client->send_file_response( $resource );
+                }
+                elsif ( $request eq "/clearlog.html" )
+                {
+                    # Create a name for the backup log.
+
+                    my $backup_log = "keyserver." . localtime() . ".log" ;
+
+                    # Make the backup, delete the LOGFILE, then recreate it.
+
+                    system( "cp", LOGFILE, $backup_log ) ;
+                    unlink LOGFILE;
+                    _logger( "KEYSERVER: log reset." ) if ENABLED_LOGGING;  
+
+                    _build_clearlog_dot_html( $backup_log );
+
+                    $http_client->send_file_response( "clearlog.html" );
+                }
+                else
+                {
+                    $http_client->send_error( RC_NOT_FOUND );
+                }
+            }
+            else
+            {
+                $http_client->send_error( RC_METHOD_NOT_ALLOWED );
+            }
+        }
+    }
+    continue
+    {
+        $http_client->close;
+        undef( $http_client );
+    }
+}
+
+sub _start_registration_service {
+
+    # The Registration Service waits passively at protocol port number 
+    # REGISTRATION_PPORT for TCP-based connections.  When one arrives,
+    # the IP address of the client is determined, a protocol port number is
+    # received, followed by a PK+.  These values are either added to the
+    # 'SCOOBY.publics' table or used to update an existing entry in 
+    # the 'SCOOBY.publics' table.  
+    #
+    # A request to add LOCALHOST and RESPONDER_PPORT to the database is 
+    # REJECTED, as these values are used by the keyserver to store it's own PK+.
+    #
+    # No ACK is provided to the client.  Clients can use the Responder Service 
+    # to check that their PK+ has been added to the database.
+    # 
+    # IN:  nothing.
+    #
+    # OUT: nothing.
+
+    my $registration_socket = IO::Socket::INET->new( 
+                                  LocalPort => REGISTRATION_PPORT,
+                                  Listen    => SOMAXCONN,
+                                  Proto     => 'tcp',
+                                  Reuse     => TRUE 
+                              );
+
+    if ( !defined( $registration_socket ) )
+    {
+        _logger( "REGISTRATION: could not create initial socket - fatal." ) if ENABLED_LOGGING;
+
+        die "keyserver: (registration): could not create socket: $!.\n";
+    }
+
+    print "The Registration Service is starting up on port: ", 
+              $registration_socket->sockport, "\n" if ENABLED_PRINTS;
+
+    _logger( "REGISTRATION: up on port: " . $registration_socket->sockport . "." ) if ENABLED_LOGGING;
+
+    # Servers are permanent - they NEVER end.
+
+    while ( TRUE ) 
+    {
+        next unless my $from_socket = $registration_socket->accept;
+
+        if ( !exists $allowed_connections{ inet_ntoa( $from_socket->peeraddr ) } )
+        {
+            _logger( "REGISTRATION: unauthorized host " .  
+                inet_ntoa( $from_socket->peeraddr ) .  
+                    " rejected." ) if ENABLED_LOGGING;
+
+            print "Warning: request from an unauthorized host (" . 
+                      inet_ntoa( $from_socket->peeraddr ) . 
+                          ") rejected.\n" if ENABLED_PRINTS;
+
+            print $from_socket "keyserver: you are NOT permitted to talk: disconnecting ... \n";
+
+            $from_socket->close;
+
+            next;
+        }
+
+        # Create a sub-process to serve client.
+
+        _logger( "REGISTRATION: creating subprocess." ) if ENABLED_LOGGING;
+
+        next if my $pid = fork; 
+ 
+        if ( $pid == 0 )
+        {
+            # The registration socket is not needed in child, so it's closed.
+
+            $registration_socket->close;
+
+            # Determine the IP address of the other end of the socket.
+
+            my $peer_ip = inet_ntoa( $from_socket->peeraddr );
+
+            # Receive the protocol port number from the socket.
+
+            my $peer_port = <$from_socket>;
+
+            # Untaint the value of "$peer_port", using a regex.
+
+            $peer_port =~ /^(\d{1,5})$/;
+            $peer_port = $1;
+
+            if ( !defined( $peer_port ) )
+            {
+                _logger( "REGISTRATION: invalid protocol port received from $peer_ip." ) if ENABLED_LOGGING;
+
+                print "Warning: invalid protocol port received - request ignored.\n" if ENABLED_PRINTS;
+
+                print $from_socket "keyserver: you sent an invalid protocol port number - disconnecting ... \n";
+
+                # No more client interaction.
+
+                close $from_socket; 
+
+                # Short-circuit as it is not possible to continue without a
+                # valid protocol port number.
+
+                next;
+            }
+
+            if ( $peer_ip eq LOCALHOST && $peer_port eq RESPONDER_PPORT )
+            {
+                _logger( "KEYSERVER: attempt to add PK+ for keyserver to database - ignored." ) if ENABLED_LOGGING;
+
+                print "Warning: attempt to add PK+ for keyserver to database - ignored.\n" if ENABLED_PRINTS;
+
+                print $from_socket "You cannot update the keyserver's PK+ - disconnecting ... \n";
+
+                # No more client interaction.
+
+                close $from_socket; 
+
+                # Short-circuit as LOCALHOST and RESPONDER_PPORT is RESERVED.
+
+                next;
+            }
+
+            # Note: we blindly trust that the client does indeed send a 
+            # PK+ value.  It's perhaps more prudent to check the PK+ 
+            # before adding it to the database?  Ah, time, if only I 
+            # had more of it ... 
+
+            my @entire_key = <$from_socket>;
+
+            close $from_socket;
+
+            my $connection = Net::MySQL->new( 
+                                 hostname  => KEYDB_HOST,
+                                 database  => KEYDB_DB,
+                                 user      => KEYDB_USER,
+                                 password  => KEYDB_PASS
+                             );
+
+            if ( $connection->is_error )
+            {
+               _logger( "REGISTRATION: could not contact database - fatal." ) if ENABLED_LOGGING;
+
+                die "keyserver: (registration): " .
+                    $connection->get_error_message . ".\n";
+            }
+
+            # Check to see if we need to do an INSERT or an UPDATE.
+
+            my $query = 'select ip_address ' .
+                        'from publics where ' .
+                        "( ip_address = \"$peer_ip\" and " .
+                        "protocol_port = \"$peer_port\" )";
+
+            $connection->query( $query );
+
+            _logger( "REGISTRATION: querying DB for existing $peer_ip/$peer_port combination." ) if ENABLED_LOGGING;
+
+            # This next line suppresses the warning messages from
+            # the Net::MySQL module - they are NOT needed/wanted here.
+
+            local $SIG{__WARN__} = sub {}; # Comment-out this line when testing.
+
+            my $iterator = $connection->create_record_iterator;
+            my $rec = $iterator->each;
+
+            if ( ref( $rec ) eq 'ARRAY' ) 
+            {
+                # The ip_address/protocol-port/key already exist, so do an UPDATE.
+
+                _logger ( "REGISTRATION: updating $peer_ip/$peer_port." ) if ENABLED_LOGGING;
+
+                print "[UPDATE] Updating the PK+ for $peer_ip/$peer_port.\n" if ENABLED_PRINTS;
+
+                $query = 'update publics set ' .
+                         "public_key = \"@entire_key\" where " .
+                         "( ip_address = \"$peer_ip\" and " .
+                         "protocol_port = \"$peer_port\" )";
+            }
+            else 
+            {
+                # The ip_address/protocol-port/key are new, so do an INSERT.
+
+                _logger ( "REGISTRATION: inserting $peer_ip/$peer_port." ) if ENABLED_LOGGING;
+
+                print "[INSERT] Inserting the $peer_ip/$peer_port pairing.\n" if ENABLED_PRINTS;
+
+                $query = 'insert into publics ' .
+                         '( ip_address, protocol_port, public_key ) values ' .
+                         "( \"$peer_ip\", \"$peer_port\", \"@entire_key\" )";
+            }
+
+            $connection->query( $query ); 
+
+            # We assume a successful insert/update, which may be a little naive.
+            # Of course, the client can always use the Responder Service to 
+            # check the state of the database, if required.
+
+            exit 0;
+        }
+
+        $from_socket->close;
+    }
+}
+
+sub _start_responder_service {
+
+    # The Responder Service waits passively at protocol port number 
+    # RESPONDER_PPORT for TCP-based connections.  When one arrives,
+    # the IP address of the client is determined, then an IP address and
+    # protocol port number is received.  These are then used to look-up a PK+ 
+    # from the 'SCOOBY.publics' table.  If a PK+ is found in the database,
+    # it is read from the 'SCOOBY.publics' table, signed by the
+    # keyserver, then sent to the client.  If the PK+ is NOT found, the 
+    # string 'NOSIG' followed by 'NOTFOUND' is sent to the client.
+    #
+    # Note: the PK+ is signed, but NOT encrypted.  There is no need to 
+    # add a further level of security.  The signature is enough, and the
+    # PK+ is a public key, after all.
+    #
+    # If a request is received for IP address LOCALHOST and protocol port
+    # RESPONDER_PPORT, then the PK+ is looked-up and sent UNSIGNED.  This is
+    # due to the fact that it does not make sense to sign the PK+ for
+    # the keyserver, as the client most likely needs the PK+ to verify
+    # signatures.  The string "SELFSIG" (followed by the PK+) is sent in this
+    # case.
+    #
+    # IN:  nothing.
+    #
+    # OUT: nothing.
+
+    my $responder_socket = IO::Socket::INET->new( 
+                               LocalPort => RESPONDER_PPORT,
+                               Listen    => SOMAXCONN,
+                               Proto     => 'tcp',
+                               Reuse     => TRUE 
+                           );
+
+    if ( !defined( $responder_socket ) )
+    {
+        _logger( "RESPONDER: could not create initial socket - fatal." ) if ENABLED_LOGGING;
+
+        die "keyserver: (responder): could not create socket: $!.\n";
+    }
+
+    print "The Responder Service is starting up on port: ", 
+              $responder_socket->sockport, "\n" if ENABLED_PRINTS;
+
+    _logger( "RESPONDER: up on port: " . $responder_socket->sockport . "." ) if ENABLED_LOGGING;
+
+    # Servers are permanent - they NEVER end.
+
+    while ( TRUE ) 
+    {
+        next unless my $from_socket = $responder_socket->accept;
+
+        if ( !exists $allowed_connections{ inet_ntoa( $from_socket->peeraddr ) } )
+        {
+            _logger( "RESPONDER: unauthorized host " . 
+                      inet_ntoa( $from_socket->peeraddr ) . 
+                          " request rejected." ) if ENABLED_LOGGING;
+
+            print "Warning: request from an unauthorized host (" . 
+                      inet_ntoa( $from_socket->peeraddr ) . 
+                          ") rejected.\n" if ENABLED_PRINTS;
+
+            print $from_socket "keyserver: you are NOT permitted to talk: disconnecting ... \n";
+
+            $from_socket->close;
+
+            next;
+        }
+
+        # Create a sub-process to serve client. 
+
+        next if my $pid = fork; 
+ 
+        if ( $pid == 0 )
+        {
+            # The Responder Socket is not needed in child, so it's closed.
+
+            $responder_socket->close;
+
+            # Receive the IP address and protocol port number to lookup.
+
+            my $ip_lookup = <$from_socket>;
+
+            chomp( $ip_lookup );
+
+            my $port_lookup = <$from_socket>;
+
+            # Untaint the value of "$ip_lookup", using a regex.
+
+            $ip_lookup =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+            $ip_lookup = $1;
+
+            if ( !defined( $ip_lookup ) )
+            {
+                _logger ( "RESPONDER: invalid IP address sent - request ignored." ) if ENABLED_LOGGING;
+
+                print "Warning: invalid IP address sent to Responder Service - request ignored.\n" if ENABLED_PRINTS;
+
+                print $from_socket "keyserver: you sent an invalid IP address - disconnecting ... \n";
+
+                # No more client interaction.
+
+                close $from_socket; 
+
+                # Short-circuit as it is not possible to continue without a
+                # valid IP address.
+
+                next;
+            }
+
+            # Untaint the value of "$port_lookup", using a regex.
+
+            $port_lookup =~ /^(\d{1,5})$/;
+            $port_lookup = $1;
+
+            if ( !defined( $port_lookup ) )
+            {
+                _logger( "RESPONDER: invalid protocol port sent by $ip_lookup - request ignored." ) if ENABLED_LOGGING;
+
+                print "Warning: invalid protocol port sent to Responder Service - request ignored.\n" if ENABLED_PRINTS;
+
+                print $from_socket "keyserver: you sent an invalid protocol port number - disconnecting ... \n";
+
+                # No more client interaction.
+
+                close $from_socket; 
+
+                # Short-circuit as it is not possible to continue without a
+                # valid protocol port number.
+
+                next;
+            }
+
+            my $connection = Net::MySQL->new( 
+                                 hostname  => KEYDB_HOST,
+                                 database  => KEYDB_DB,
+                                 user      => KEYDB_USER,
+                                 password  => KEYDB_PASS
+                             );
+
+            if ( $connection->is_error )
+            {
+               _logger( "RESPONDER: could not contact database - fatal." ) if ENABLED_LOGGING;
+
+                die "keyserver: (responder): " .
+                    $connection->get_error_message . ".\n";
+            }
+
+            print "Checking the PK+ value for $ip_lookup/$port_lookup.\n" if ENABLED_PRINTS;
+
+            # Check to see if the ip_address/protocol port exists in the db.
+
+            my $query = 'select public_key ' .
+                        'from publics where ' .
+                        "( ip_address = \"$ip_lookup\" and " .
+                        "protocol_port = \"$port_lookup\" )";
+
+            $connection->query( $query );
+
+            _logger( "RESPONDER: querying DB for existing $ip_lookup/$port_lookup combination." ) if ENABLED_LOGGING;
+
+            # This next line suppresses the warning messages from
+            # the Net::MySQL module - they are NOT needed/wanted here.
+
+            local $SIG{__WARN__} = sub {}; # Comment-out this line when testing.
+
+            my $iterator = $connection->create_record_iterator;
+            my $rec = $iterator->each;
+
+            # If the ip_address/protocol-port/key exist, send the PK+.
+            if ( ref( $rec ) eq 'ARRAY' ) 
+            {
+                if ( $ip_lookup eq LOCALHOST && $port_lookup eq RESPONDER_PPORT )
+                {
+                    _logger( "RESPONDER: sending my PK+ to " .
+                        inet_ntoa( $from_socket->peeraddr ) .  "." ) if ENABLED_LOGGING;
+
+                    print "  -> No need to sign PK+ for keyserver.\n" if ENABLED_PRINTS;
+                    print "  --> Sending SELFSIG to client (" . 
+                              inet_ntoa( $from_socket->peeraddr ) . 
+                                  ").\n" if ENABLED_PRINTS;
+
+                    # The ip_address is that of the keyserver, so send "SELFSIG".
+                    print $from_socket "SELFSIG" . SIGNATURE_DELIMITER;
+
+                    print "  ---> Sending PK+ for $ip_lookup/$port_lookup to client.\n" if ENABLED_PRINTS;
+
+                    # Send the keyserver's PK+ to the client.
+
+                    print $from_socket "$rec->[0]";
+                }
+                else
+                {
+                    _logger( "RESPONDER: sending PK+ for $ip_lookup/$port_lookup to " .
+                        inet_ntoa( $from_socket->peeraddr ) .  "." ) if ENABLED_LOGGING;
+
+                    print "  -> Signing PK+ for $ip_lookup/$port_lookup.\n" if ENABLED_PRINTS;
+
+                    # Get the PK- from it's disk-file.
+                    my $ksf = LOCALHOST . '.' . RESPONDER_PPORT . '.private';
+
+                    my $pkminus = new Crypt::RSA::Key::Private( 
+                                         Filename => $ksf,
+                                         Password => KEYSRV_PASSWD,
+                                         Armour   => TRUE
+                                     );  
+
+                    my $rsa = new Crypt::RSA;
+
+                    # Use the PK- to sign the PK+.
+
+                    my $signature = $rsa->sign(
+                                         Message => $rec->[0],
+                                         Key     => $pkminus,
+                                         Armour  => TRUE
+                                     );
+
+                    print "  --> Sending signature to client (" .
+                              inet_ntoa( $from_socket->peeraddr ) . 
+                                  ").\n" if ENABLED_PRINTS;
+
+                    # Send the printable signature to the client.
+
+                    print $from_socket "$signature" . SIGNATURE_DELIMITER;
+
+                    print "  ---> Sending PK+ for $ip_lookup/$port_lookup to client.\n" if ENABLED_PRINTS;
+
+                    # Send the PK+ to the client.
+
+                    print $from_socket "$rec->[0]";
+                }
+            }
+            else 
+            {
+                _logger( "RESPONDER: sending NOSIG/NOTFOUND for $ip_lookup/$port_lookup to " .
+                    inet_ntoa( $from_socket->peeraddr ) .  "." ) if ENABLED_LOGGING;
+
+                print "  -> Sending NOSIG to client (" . 
+                              inet_ntoa( $from_socket->peeraddr ) . 
+                                  ").\n" if ENABLED_PRINTS;
+
+                # The ip_address/protocol-port does not exist, send "NOSIG".
+
+                print $from_socket "NOSIG" . SIGNATURE_DELIMITER;
+ 
+                print "  --> Sending NOTFOUND for $ip_lookup/$port_lookup to client.\n" if ENABLED_PRINTS;
+
+                # The ip_address/protocol-port does not exist, send "NOTFOUND".
+
+                print $from_socket "NOTFOUND";
+            }
+
+            $from_socket->close;
+
+            exit 0;
+        }
+
+        # Not needed in the parent's code, so it is closed.
+
+        $from_socket->close;
+    }
+}
+
+##########################################################################
+# Main code starts here
+##########################################################################
+
+# Start by populating the "%allowed_connections" hash from the keyserver's
+# configuration file.  Connections from every other IP address/port are 
+# ignored/rejected.
+
+open CONFIGFILE, CONFIGHOSTS_FILE
+    or die "keyserver: the .keyserverrc configuration file does not exist: $!.\n";
+
+while ( my $line = <CONFIGFILE> )
+{
+    chomp( $line );
+
+    my ( $host, $port ) = split /:/, $line;
+    
+    $allowed_connections{ $host } = $port;
+}
+
+close CONFIGFILE;
+
+print "Accepting connections/requests from:\n" if ENABLED_PRINTS;
+
+while ( my ( $host, $port ) = each %allowed_connections )
+{
+    print "  -> $host on port(s): $port.\n" if ENABLED_PRINTS;
+}
+
+# Prior to starting the network servers, check the database to see if a
+# PK+ value exists for itself (using address LOCALHOST).  If it does, 
+# then things are fine-and-dandy.  If the PK+ is missing, both the 
+# PK- and PK+ keys are regenerated and the database/disk-files updated.
+
+# Begin by opening a new connection to the database.
+
+my $connection = Net::MySQL->new( 
+                     hostname  => KEYDB_HOST,
+                     database  => KEYDB_DB,
+                     user      => KEYDB_USER,
+                     password  => KEYDB_PASS
+                 );
+
+if ( $connection->is_error )
+{
+    _logger( "KEYSERVER: could not contact database - fatal." ) if ENABLED_LOGGING;
+
+    die "keyserver: " . $connection->get_error_message . ".\n";
+}
+
+# Check to see if an entry exists in the database.  Start by assuming
+# the worst, that is: there is no PK- in database.
+
+my $pkplus_in_db = FALSE; 
+
+my $query = 'select ip_address ' .
+            'from publics where ' . 
+            '( ip_address = "' . LOCALHOST . '" and ' .
+            'protocol_port = "' . RESPONDER_PPORT . '" )';
+
+$connection->query( $query ); 
+
+my $iterator = $connection->create_record_iterator;
+my $rec = $iterator->each;
+
+# The $rec scalar will reference an array if an entry was found in the database.
+
+if ( ref( $rec ) eq 'ARRAY' )
+{
+    $pkplus_in_db = TRUE;
+}
+
+if ( !$pkplus_in_db )
+{
+    # We need to (re)generate the PK-/PK+ pairing, update the database with
+    # the PK+ and store the PK- in a disk-file.
+
+    my $rsa = new Crypt::RSA;
+
+    print "Generating a public/private key-pairing for this keyserver.  " if ENABLED_PRINTS;
+    print "Please wait ... \n" if ENABLED_PRINTS;
+
+    my $ksf = LOCALHOST . '.' . RESPONDER_PPORT;
+
+    my ( $public, $private ) = 
+            $rsa->keygen(
+                Identity  => 'Scooby Key Server',
+                Size      => KEY_SIZE,
+                Password  => KEYSRV_PASSWD,
+                Filename  => $ksf,
+                Verbosity => FALSE
+            );
+
+    print "Generated.  Keyserver starting ... \n" if ENABLED_PRINTS;
+
+    # The PK+ and PK- now exist in the "LOCALHOST.RESPONDER_PPORT.public" and 
+    # "LOCALHOST.RESPONDER_PPORT.private" disk-files.  So, add the PK+ to the
+    # 'SCOOBY.publics' table.
+
+    open KEYFILE, "$ksf.public" 
+        or die "keyserver: The public KEYFILE does not exist: $!.\n";
+
+    my @entire_keyfile = <KEYFILE>;
+
+    close KEYFILE;
+
+    # The assumption here is that the entry does NOT exist in the database,
+    # so we use an INSERT as opposed to an UPDATE statement.
+
+    $query = 'insert into publics ' . 
+             '( ip_address, protocol_port, public_key ) values  ' . 
+             '( "' . LOCALHOST . '", "' . RESPONDER_PPORT . '", ' .
+             "\"@entire_keyfile\" )";
+
+    $connection->query( $query );  # We (naively) assume success.
+}
+else
+{
+    print "Using the existing public/private key-pairing for this keyserver.\n" if ENABLED_PRINTS;
+    print "Keyserver starting ... \n" if ENABLED_PRINTS;
+}
+
+$connection->close;
+
+# Create a sub-process to handle the monitoring web server.
+
+my $http_pid = fork;
+
+if ( !defined( $http_pid ) )
+{
+    _logger( "KEYSERVER: unable to create HTTP service." ) if ENABLED_LOGGING;
+
+    die "keyserver: unable to create HTTP subprocesses: $!.\n";
+}
+
+if ( $http_pid == FALSE )
+{
+    _logger( "KEYSERVER: starting the HTTP service." ) if ENABLED_LOGGING;
+
+    _start_web_service if ENABLED_LOGGING; 
+
+     exit 0;  # Which will execute if ENABLED_LOGGING is false.
+}
+else
+{
+    # With the PK- and PK+ in place, we can now create the Responder and 
+    # Registration services by forking a child process.
+
+    my $pid = fork; 
+
+    if ( !defined( $pid ) )
+    {
+        _logger( "KEYSERVER: unable to create subprocesses." ) if ENABLED_LOGGING;
+
+        die "keyserver: unable to create initial subprocesses: $!.\n";
+    }
+
+    if ( $pid == FALSE )
+    {
+        # This is the child process executing.
+        # This next call is NEVER returned from.
+
+        _start_registration_service; 
+    }
+    else
+    {
+        # This is the parent process executing.
+        # This next call is NEVER returned from.
+
+        _start_responder_service; 
+    }
+}
+
+##########################################################################
+# Documentation starts here.
+##########################################################################
+
+=head1 NAME
+
+keyserver - an RSA-based public keyserver for use with B<Devel::Scooby> (which includes HTTP monitoring facility at port 8080).
+
+=head1 VERSION
+
+1.04
+
+=head1 SYNOPSIS
+
+Create a ".keyserverrc" configuration file (see FILES), set-up the required database (see ENVIRONMENT), then invoke the keyserver:
+
+=over 4
+
+    ./keyserver
+
+=back
+
+=head1 DESCRIPTION
+
+This keyserver provides three services to clients that communicate with it.
+
+1. The "Responder Service" runs on port B<RESPONDER_PPORT> and listens for requests from clients.  These take the form of an IP address in dotted-decimal notation, followed by a protocol port number.  The IP address/port-number are looked-up in the SCOOBY.publics table (see ENVIRONMENT), and - if found - the associated public key is extracted from the table and signed using this keyserver's private key.  Both the signature and the public key are then sent to the client.  
+
+If the lookup fails, the strings "NOSIG" followed by "NOTFOUND" are returned to the client.
+
+If the IP address is LOCALHOST (which defaults to 127.0.0.1) and the protocol port number is RESPONDER_PPORT (which defaults to 30001), then this program returns the string "SELFSIG" followed by an UNSIGNED copy of this keyserver's public key.  In this way, a client can retrieve the public key to use when verifying signatures.
+
+2. The "Registration Service" runs on port B<REGISTRATION_PPORT> and listens for connections from clients.  When on arrives, it is immediately followed by a protocol port number, then a public key.  This key is added to the SCOOBY.publics table (see ENVIRONMENT) together with the clients IP address in dotted-decimal notation and the protocol port number.  For obvious reasons, the received public key is NOT signed by the client.
+
+Note that changing the defined constant values for B<REGISTRATION_PPORT> and B<RESPONDER_PPORT> from their defaults will require source code changes to programs that interact with this keyserver (which includes the B<Devel::Scooby>, B<Mobile::Executive> and B<Mobile::Location> modules).  So, don't change these constant values unless you really have to.
+
+3. The "HTTP-based Monitoring Service" runs on port HTTP_PORT (which defaults to 8080), and provides a mechanism to remotely check the status of the keyserver via the world-wide-web.  The LOGFILE can be viewed and (optionally) reset via the web-based interface.  Resetting the LOGFILE results in an archived copy of the LOGFILE-to-date being created on the keyserver's local storage.
+
+=head1 ENVIRONMENT
+
+It is assumed that the MySQL RDBMS is executing on the same machine as this keyserver.  Here's a quick list of MySQL-specific instructions for creating a database and table required to support this program: 
+
+=over 4
+
+    mysql -u root -p
+
+    mysql> create database SCOOBY;
+    mysql> use mysql;
+    mysql> grant all on SCOOBY.* to perlagent identified by 'passwordhere';
+    mysql> quit
+
+    mysql -u perlagent -p SCOOBY < create_publics.sql
+
+=back
+
+If you use a different user-id/password combo to that shown above, be sure to change the two constants defined at the start of the source code (KEYDB_USER and KEYDB_PASS).
+
+where the B<create_publics.sql> disk-file contains:
+
+=over 4
+
+    create table publics
+    (
+        ip_address       varchar (16)  not null,
+        protocol_port    varchar (6)   not null,
+        public_key       text          not null 
+    )
+
+=back
+
+=head1 FILES
+
+A configuration file, called ".keyserverrc", needs to exist in the same directory as this keyserver.  Its contents detail the IP address and protocol port numbers that connections will be allowed from.  Typically, it will look something like this:
+
+=over 4
+
+    127.0.0.1:*
+    192.168.22.14:*
+
+=back 
+
+which allows any connection (on any port) from both 127.0.0.1 and 192.168.22.14.  Note that (at the moment), specifying a protocol port number in place of "*" has no effect.  Connection from all ports on the specified IP address are allowed.  This will change in a future release.
+
+When first executed, this keyserver creates two disk-files:
+
+=over 4
+
+    "LOCALHOST.RESPONDER_PPORT.public", and
+    "LOCALHOST.RESPONDER_PPORT.private".  
+
+=back 
+
+These contain this keyserver's RSA public and private keys, respectively.  The public key is also added to the MySQL database.  
+
+DO NOT remove these files from the directory that runs this keyserver. 
+
+DO NOT edit these files, either.
+
+The keyserver also logs all communication with it (in a disk-file called "keyserver.log").  The contents of this log can be viewed (and archives of it created) using the "HTTP-based Monitoring Service" (see DESCRIPTION).
+
+=head1 FOUR IMPORTANT CONSTANTS
+
+Near the start of the keyserver's source code, four constants are defined as follows:
+
+=over 4
+
+    use constant KEYSRV_PASSWD       => 'keyserver';
+    use constant KEY_SIZE            => 1024;
+
+    use constant ENABLED_LOGGING     => 1;
+    use constant ENABLED_PRINTS      => 1; 
+
+=back
+
+Change the first two constants to values of your choosing to set the password (KEYSRV_PASSWD) and the key size (KEY_SIZE) to use during the PK+/PK- generation.  Note: the larger the key size, the stronger the encryption, but, the slower this software will run.  The default value for KEY_SIZE should suffice for most situations.
+
+Set ENABLED_LOGGING to 0 switch off disk-based logging and the HTTP-based Monitoring Service.  
+
+Set ENABLED_PRINTS to 0 to disable the the display of status messages on STDOUT.
+
+=head1 SEE ALSO
+
+The B<Devel::Scooby>, B<Mobile::Executive> and B<Mobile::Location> modules. 
+
+The following CPAN modules are assumed to be installed: B<Net::MySQL> and B<Crypt::RSA>.  The HTTP server requires B<HTTP::Daemon> and B<HTTP::Status>, which are installed as part of the B<libwww-perl> library (also available on CPAN).
+
+The Scooby Website: B<http://glasnost.itcarlow.ie/~scooby/>.
+
+=head1 AUTHOR
+
+Paul Barry, Institute of Technology, Carlow in Ireland, B<paul.barry@itcarlow.ie>, B<http://glasnost.itcarlow.ie/~barryp/>.
+
+=head1 COPYRIGHT
+
+Copyright (c) 2003, Paul Barry.  All Rights Reserved.
+
+This module is free software.  It may be used, redistributed and/or modified under the same terms as Perl itself.
+
